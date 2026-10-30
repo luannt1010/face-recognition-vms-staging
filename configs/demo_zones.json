@@ -1,0 +1,17 @@
+{
+  "ai_zones": [
+    {
+      "id": "demo-polygon",
+      "code": "DEMO_POLYGON",
+      "name": "Demo polygon",
+      "ai_modules": "FACE",
+      "is_active": true,
+      "points": [
+        {"x": 0.25, "y": 0.45},
+        {"x": 0.75, "y": 0.45},
+        {"x": 0.85, "y": 0.90},
+        {"x": 0.15, "y": 0.90}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+model_detect:
+  # Đường dẫn tương đối tính từ root project; ghi đè bằng FACE_DETECTOR_WEIGHTS.
+  weight: 'experiments/detector_tensorrt/outputs/img640/fp16/detector.engine'
+
+model_extract:
+  # Có thể ghi đè bằng FACE_EXTRACTOR_WEIGHTS.
+  weight: "D:/private/face-recognition-system/checkpoints/test_SGD/checkpoints/face_embedding_model.onnx"
+
+inference:
+  conf: 0.5
+  imgsz: 640
+  classes: null
+  device: 0
+
+# Phát IN/OUT khi tâm mặt đi vào/ra polygon hoặc cắt line của VMS.
+runtime:
+  processing_fps: 10
+  recognition_threshold: 0.4
+  # Theo từng camera + vùng + track. Chuyển hướng trong cooldown bị bỏ.
+  event_cooldown: 1.0
+  track_ttl: 2.0
+  min_face_size: 32
+  boundary_margin: 0.003
+  # Mỗi track nhận diện lại sau 0.5 giây; frame IN/OUT luôn dùng kết quả mới.
+  recognition_interval: 0.5

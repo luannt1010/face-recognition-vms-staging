@@ -1,0 +1,27 @@
+# Giữ project/container/volume của database hiện có.
+name: task2_atin
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: face_recognition_pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Missing POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Missing POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Missing POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:?Missing POSTGRES_HOST_PORT in .env}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres_data:
+    name: face_recognition_pgdata
