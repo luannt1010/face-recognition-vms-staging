@@ -80,14 +80,23 @@ main hỗ trợ ghi đè bằng `--detector-model`.
 Tự tạo `.env` tại root bằng thông tin của môi trường triển khai. Không commit
 file này. Các biến được sử dụng gồm:
 
-- Database: `DATABASE_URL`, hoặc `PGHOST`, `PGPORT`, `POSTGRES_DB`,
-  `POSTGRES_USER`, `POSTGRES_PASSWORD`.
-- Docker Compose: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`,
-  `POSTGRES_HOST_PORT`.
-- MQTT: `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`,
-  `MQTT_CLIENT_ID`.
-- Phạm vi VMS: `VMS_ZONE_ID`, `VMS_ORGANIZATION_ID`.
-- Snapshot: `VMS_STORAGE_UPLOAD_URL`.
+```bash
+MQTT_HOST=<YOUR-BROKER>
+MQTT_PORT=<YOUR-PORT>
+MQTT_USERNAME=<YOUR-USERNAME>
+MQTT_PASSWORD=<YOUR-PASSWORD>
+MQTT_CLIENT_ID=<YOUR-ID>
+VMS_ORGANIZATION_ID=103
+VMS_ZONE_ID=51
+VMS_STORAGE_UPLOAD_URL=<YOUR-URL>
+
+POSTGRES_DB=face_recognition
+POSTGRES_USER=face_app
+POSTGRES_PASSWORD=<YOUR-PASSWORD>
+POSTGRES_HOST_PORT=55432
+
+DATABASE_URL=postgresql://face_app:<YOUR-PASSWORD>@127.0.0.1:55432/face_recognition
+````
 
 `MQTT_HOST` chỉ chứa hostname. Thông tin kết nối database phải khớp với
 container. Python chạy trực tiếp trên Windows dùng localhost và port được
