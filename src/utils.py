@@ -231,7 +231,31 @@ def yolov5_facepostprocess(input_data,OBJ_THRESH,NMS_THRESH):
 def l2_normalize(embedding, eps=1e-6):
     return np.divide(embedding, np.maximum(np.linalg.norm(embedding, axis=-1, keepdims=True), eps))
 
+def bbox2ltwh(bboxes: list[list[int | float]]):
+    results = []
+    if len(bboxes) < 1:
+        return results
+    for bbox in bboxes:
+        x1, y1, x2, y2 = bbox
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("wrong format for bounding box")
+        w, h = x2 - x1, y2 - y1
+        results.append([x1, y1, w, h])
+    return results
+
+def convert_yolo_2_ds(yolo_detections):
+    results = []
+    bboxes = bbox2ltwh(yolo_detections["bbox"])
+    scores = yolo_detections["det_score"]
+    if len(bboxes) != len(scores):
+        raise ValueError("len bbox is difference with len score")
+    for bbox, score in zip(bboxes, yolo_detections["det_score"]):
+        results.append((bbox, score, "person"))
+    return results
 
 
 if __name__ == "__main__":
-    check_database_connection()
+    # check_database_connection()
+
+    yolo_d = {"bbox": [[1, 2, 3, 4], [2, 3, 4, 5]], "det_score": [1,2]}
+    print(convert_yolo_2_ds(yolo_d))

@@ -1,4 +1,5 @@
 import cv2
+import time
 import logging
 import threading
 from queue import Queue, Empty, Full
@@ -121,23 +122,25 @@ class CameraReader:
 
 def run_demo(line=None, *, rtsp_url, weights=None, device=None, debug=False,
              zones=None, config_path=None):
-    """Demo local: nhận diện + IN/OUT, không kết nối MQTT.
+    """Demo local: YOLO + BoT-SORT theo người, SCRFD + InsightFace gắn tên.
 
     Mặc định đọc polygon từ configs/demo_zones.json.
     line: [[x1,y1], [x2,y2]] chuẩn hoá 0..1, IN theo pháp tuyến trái a -> b.
     zones: list polygon/line theo định dạng ai_zones của VMS (ưu tiên hơn line).
+    weights: tên bộ model SCRFD của InsightFace, mặc định buffalo_s.
     Nhấn Q hoặc Esc để thoát.
     """
     import os
     from pathlib import Path
     import unicodedata
     from dotenv import load_dotenv
-    from main import load_config, model_path, recognize_faces
-    from src.core_ai.detector import InferenceWorker
+    from main import load_config, model_path, recognize_people
+    from src.core_ai.detector import SCRFDDetector, PersonDetector, SCRFDTensorRTDetector
     from src.core_ai.event_processor import EventProcessor
     from src.core_ai.identity_cache import IdentityCache
-    from src.core_ai.extractor import Extractor
-    from src.core_ai.tracker import FaceTracker
+    from src.core_ai.identity_manager import IdentityManager
+    from src.core_ai.extractor import InsightFaceExtractor
+    from src.core_ai.tracker import PersonTrackerBoTSORT, PersonTrackerDeepSort
     from src.database.verifier import Verifier
 
     root = Path(__file__).resolve().parents[2]
@@ -175,21 +178,30 @@ def run_demo(line=None, *, rtsp_url, weights=None, device=None, debug=False,
                   'line': {'points': [{'x': a[0], 'y': a[1]}, {'x': b[0], 'y': b[1]}]},
                   'direction_point': {'x': direction[0], 'y': direction[1]}}]
 
-    inference = dict(config['inference'])
-    if device is not None:
-        inference['device'] = int(device) if str(device).isdigit() else device
-    detector = InferenceWorker(
-        wp=model_path(weights or os.getenv('FACE_DETECTOR_WEIGHTS') or config['model_detect']['weight']),
-        **inference)
-    extractor = Extractor(model_path(
-        os.getenv('FACE_EXTRACTOR_WEIGHTS') or config['model_extract']['weight']))
+    inference = config.get('inference', {})
+    device = device if device is not None else inference.get('device', 0)
+    imgsz = inference.get('imgsz', 640)
+    det_size = (imgsz, imgsz) if isinstance(imgsz, int) else tuple(imgsz)
+    # detector = SCRFDDetector(model_name=weights or config.get('model_detect', {}).get('model_name', 'buffalo_s'),
+    #                          det_size=det_size,
+    #                          det_thresh=inference.get('conf', 0.5), device=device)
+    detector = SCRFDTensorRTDetector(engine_path=r"D:\vms-combine-ai\det_500m_fp16.engine",
+                             det_size=det_size,
+                             det_thresh=inference.get('conf', 0.5), device=device)
+    extractor = InsightFaceExtractor(model_path(config['model_extract']['weight']), device=device)
+    detector.warmup()
     extractor.warmup()
     processor = EventProcessor(cooldown=runtime.get('event_cooldown', 1),
                                track_ttl=runtime.get('track_ttl', 2),
                                boundary_margin=runtime.get('boundary_margin', .003))
-    tracker = FaceTracker(fps=fps)
+    person_config = dict(config.get('person_tracking', {}))
+    person_weights = model_path(person_config.pop('weight', 'models/detector/yolo11n.pt'))
+    person_detector = PersonDetector(model_path=person_weights, conf=person_config["conf"], imgsz=person_config["imgsz"], device=device)
+    # tracker = PersonTracker(lost_track_buffer=person_config.get('lost_track_buffer', 30))
+    tracker = PersonTrackerDeepSort()
     identity_cache = IdentityCache(interval=runtime.get('recognition_interval', .5),
                                     ttl=processor.track_ttl)
+    identity_manager = IdentityManager(ttl=processor.track_ttl)
     camera = CameraReader(cam_id='demo', rtsp_url=rtsp_url)
     verifier = None
     generation, last_frame = None, None
@@ -202,7 +214,10 @@ def run_demo(line=None, *, rtsp_url, weights=None, device=None, debug=False,
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         camera.start()
         logger.info('Demo local đang chạy. Nhấn Q hoặc Esc để thoát.')
+        timing_samples = []
+        timing_window_started = time.monotonic()
         while True:
+            loop_started = time.perf_counter()
             started = time.monotonic()
             if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
                 break
@@ -217,26 +232,30 @@ def run_demo(line=None, *, rtsp_url, weights=None, device=None, debug=False,
                 continue
             if (sample['generation'] != generation
                     or (last_frame is not None and captured-last_frame > processor.track_ttl)):
-                tracker = FaceTracker(fps=fps)
+                tracker.reset()
                 processor.reset('demo')
                 identity_cache.clear()
+                identity_manager.clear()
                 labels.clear()
             generation, last_frame = sample['generation'], captured
             frame = sample['frame']
 
-            # Pipeline: detect -> track -> identity -> event.
-            detections = detector.predict([frame])[0]
-            tracks = tracker.update(detections)
-            tracks, identities = recognize_faces(frame, tracks, extractor, verifier, min_face_size,
-                                                 debug=debug, cache=identity_cache, now=captured)
+            t0 = time.perf_counter()
+            # Track chính theo người. Mặt chỉ cung cấp tên cho person track.
+            person_result = person_detector.detect(frame)
+            t1 = time.perf_counter()
+            tracks = tracker.update(person_result, frame)
+            alive_track_ids = tracker.get_track_ids()
+            t2 = time.perf_counter()
+            detections = detector.detect_many_faces(frame)
+            t3 = time.perf_counter()
             events = processor.process('demo', tracks, frame.shape, zones, now=captured)
-            if events:
-                event_ids = {event['track_id'] for event in events}
-                event_tracks = [track for track in tracks if track['track_id'] in event_ids]
-                _, fresh = recognize_faces(frame, event_tracks, extractor, verifier, min_face_size,
-                                            debug=debug, cache=identity_cache, now=captured,
-                                            force_ids=event_ids)
-                identities.update(fresh)
+            t4 = time.perf_counter()
+            _, identities = recognize_people(
+                frame, tracks, detections, extractor, verifier, min_face_size,
+                identity_manager=identity_manager, identity_cache=identity_cache, now=captured,
+                force_ids={event['track_id'] for event in events}, debug=debug, alive_track_ids=alive_track_ids)
+            t5 = time.perf_counter()
             now = time.monotonic()
             labels = {key: value for key, value in labels.items() if value[1] > now}
             for event in events:
@@ -247,11 +266,11 @@ def run_demo(line=None, *, rtsp_url, weights=None, device=None, debug=False,
                 print(f"[{event['direction']}] track={track_id} name={name} "
                       f"zone={event['zone_id']} score={identity.get('score_match')}", flush=True)
             if debug and now >= next_debug:
-                logger.info('detections=%s tracks=%s identities=%s',
+                logger.info('faces=%s person_tracks=%s identities=%s',
                             len(detections['bbox']), len(tracks), identities)
                 next_debug = now+1
 
-            # Vẽ sau khi nhận diện để crop mặt không dính chữ và khung.
+            # Vẽ sau khi nhận diện để ảnh extract không dính chữ và khung.
             display = frame.copy()
             height, width = frame.shape[:2]
             for zone in zones:
@@ -272,6 +291,9 @@ def run_demo(line=None, *, rtsp_url, weights=None, device=None, debug=False,
                     target = (round(point['x']*width), round(point['y']*height))
                     cv2.arrowedLine(display, midpoint, target, (0, 255, 255), 2)
                     cv2.putText(display, 'IN', target, cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
+            for bbox in detections['bbox']:
+                x1, y1, x2, y2 = map(int, bbox)
+                cv2.rectangle(display, (x1, y1), (x2, y2), (255, 200, 0), 1)
             for track in tracks:
                 track_id = track['track_id']
                 identity = identities[track_id]
@@ -285,7 +307,7 @@ def run_demo(line=None, *, rtsp_url, weights=None, device=None, debug=False,
                 text = f'{track_id}: {name}{score_text} {direction}'
                 color = (0, 255, 0) if identity['matched'] else (0, 0, 255)
                 x1, y1, x2, y2 = map(int, track['bbox'])
-                # Chấm tâm là điểm EventProcessor dùng để xét trong/ngoài vùng.
+                # Demo xét IN/OUT theo tâm bbox người, kể cả khi không thấy mặt.
                 cv2.circle(display, ((x1+x2)//2, (y1+y2)//2), 4, color, -1)
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(display, text, (max(0, x1), max(20, y1-8)),
@@ -294,7 +316,39 @@ def run_demo(line=None, *, rtsp_url, weights=None, device=None, debug=False,
             if scale < 1:
                 display = cv2.resize(display, (round(width*scale), round(height*scale)))
             cv2.imshow(window, display)
+            t6 = time.perf_counter()
             time.sleep(max(0, 1/fps - (time.monotonic()-started)))
+            t7 = time.perf_counter()
+            timing_samples.append({
+                "person": (t1 - t0) * 1000,
+                "tracking": (t2 - t1) * 1000,
+                "face_detect": (t3 - t2) * 1000,
+                "event": (t4 - t3) * 1000,
+                "recognition": (t5 - t4) * 1000,
+                "output": (t6 - t5) * 1000,
+                "sleep": (t7 - t6) * 1000,
+                "processing": (t6 - loop_started) * 1000,
+                "loop": (t7 - loop_started) * 1000,
+            })
+            timing_now = time.monotonic()
+            elapsed = timing_now - timing_window_started
+            if elapsed >= 1.0:
+                count = len(timing_samples)
+                averages = {
+                    key: sum(sample[key] for sample in timing_samples) / count
+                    for key in timing_samples[0]
+                }
+                worst = max(sample["processing"] for sample in timing_samples)
+                details = " ".join(
+                    f"{key}={value:.1f}ms"
+                    for key, value in averages.items()
+                )
+                logger.info(
+                    "PERF demo fps=%.1f %s max_processing=%.1fms",
+                    count / elapsed, details, worst,
+                )
+                timing_samples.clear()
+                timing_window_started = timing_now
     except KeyboardInterrupt:
         logger.info('Dừng demo.')
     finally:
@@ -309,9 +363,10 @@ if __name__ == '__main__':
     from pathlib import Path
 
     parser = argparse.ArgumentParser(description='Local face recognition and IN/OUT demo')
-    parser.add_argument('--rtsp', required=True, help='Camera RTSP URL')
-    parser.add_argument('--weights', help='Override detector weights')
-    parser.add_argument('--device', help='cpu or GPU index, e.g. 0')
+    parser.add_argument('--rtsp', help='Camera RTSP URL', default=r"rtsp://192.168.1.198:28537/io")
+    parser.add_argument('--detector-model', '--weights', dest='weights',
+                        help='InsightFace SCRFD model pack name (default: buffalo_s)')
+    parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--config', type=Path, help='Config YAML path')
     parser.add_argument('--zones', type=Path, help='VMS JSON: ai_zones array or object with ai_zones')
     parser.add_argument('--debug', action='store_true')

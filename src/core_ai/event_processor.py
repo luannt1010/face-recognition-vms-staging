@@ -34,7 +34,7 @@ def _inside(p, points):
 
 
 class EventProcessor:
-    """Xác định IN/OUT từ tâm bbox khuôn mặt. Không chạy model hay gửi MQTT."""
+    """Xác định IN/OUT từ tâm bbox track (mặt hoặc người). Không gửi MQTT."""
     def __init__(self, cooldown=1.0, track_ttl=2.0, boundary_margin=0.003):
         if (not all(math.isfinite(v) for v in (cooldown, track_ttl, boundary_margin))
                 or cooldown < 0 or track_ttl <= 0 or boundary_margin < 0):
@@ -51,7 +51,7 @@ class EventProcessor:
     def process(self, camera_code, tracks, frame_shape, zones, now=None):
         """Trả list {track_id, zone_id, zone_name, direction} cho frame hiện tại.
 
-        tracks: đầu ra FaceTracker (bbox pixel, is_detection=True).
+        tracks: đầu ra FaceTracker/PersonTracker (bbox pixel, is_detection=True).
         zones: mảng ai_zones từ topic .../ai_zones/FACE.
         frame_shape: frame.shape; now dùng time.monotonic(), có thể truyền khi test.
         """

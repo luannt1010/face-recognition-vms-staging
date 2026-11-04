@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, Mock
 
 from main import recognize_faces, process_frame
 from src.core_ai.identity_cache import IdentityCache
+from src.core_ai.identity_manager import IdentityManager
 
 
 class CacheTests(TestCase):
@@ -57,13 +58,14 @@ class CacheTests(TestCase):
     def test_event_publish_uses_fresh_identity(self):
         self.recognize(0)
         detector, tracker, processor, vms = Mock(), Mock(), Mock(), Mock()
-        detector.predict.return_value = [{'bbox': [[20, 20, 70, 70]]}]
-        tracker.update.return_value = self.tracks
+        detector.detect_many_faces.return_value = {
+            'bbox': [[20, 20, 70, 70]], 'landmarks': [[[0, 0]] * 5], 'det_score': [.9]}
+        tracker.update.return_value = [dict(self.tracks[0], bbox=[10, 10, 80, 100])]
         processor.process.return_value = [{'track_id': 1, 'zone_id': 'z', 'direction': 'IN'}]
         vms.get_zones.return_value = []
         sample = {'frame': self.frame, 'captured_monotonic': .1, 'captured_at': 'timestamp'}
         process_frame('CAM', sample, tracker, detector, self.extractor, self.verifier,
-                      processor, vms, 32, None, identity_cache=self.cache)
+                      processor, vms, 32, None, identity_cache=self.cache, identity_manager=IdentityManager())
         self.assertFalse(vms.publish_face.call_args.args[2]['matched'])
         self.assertFalse(vms.publish_bbox.call_args.kwargs['identities'][1]['matched'])
         self.assertEqual(self.extractor.extract.call_count, 2)

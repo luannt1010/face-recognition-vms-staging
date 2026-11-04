@@ -1,13 +1,19 @@
-"""Chạy: python main.py --config configs/config.yml. Dừng bằng Ctrl+C."""
-
 import argparse
 import logging
 import os
 from pathlib import Path
 import time
+from dotenv import load_dotenv
 
 from src.core_ai.event_processor import EventProcessor
 from src.core_ai.identity_cache import IdentityCache
+from src.core_ai.identity_manager import IdentityManager, associate_faces
+from src.core_ai.camera_reader import CameraReader
+from src.core_ai.detector import InferenceWorker, SCRFDDetector, PersonDetector
+from src.core_ai.extractor import InsightFaceExtractor
+from src.core_ai.tracker import PersonTrackerBoTSORT, PersonTrackerDeepSort
+from src.database.verifier import Verifier
+from src.vms_service.vms_client import VMSClient
 
 ROOT = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
@@ -48,8 +54,12 @@ def recognize_faces(frame, tracks, extractor, verifier, min_face_size, debug=Fal
         identity = cache.get(track_id, now, force=track_id in force_ids) if cache is not None else None
         if identity is None:
             # Vẫn extract từng mặt; chỉ chạy khi chưa có cache hoặc cần làm mới.
-            face = frame[y1:y2, x1:x2]
-            embedding = extractor.extract(face)
+            landmarks = track.get('landmarks')
+            if landmarks is not None:
+                # Landmarks ở hệ tọa độ ảnh gốc, chỉ align khi cần làm mới identity.
+                embedding = extractor.extract(frame, landmarks, align=True)
+            else:
+                embedding = extractor.extract(frame[y1:y2, x1:x2])
             identity = verifier.verify(embedding, debug=True) if debug else verifier.verify(embedding)
             # stt database local không phải person_id trên VMS; dùng user_code.
             identity.pop("person_id", None)
@@ -60,36 +70,47 @@ def recognize_faces(frame, tracks, extractor, verifier, min_face_size, debug=Fal
     return valid_tracks, identities
 
 
-def process_frame(code, sample, tracker, detector, extractor, verifier, processor,
-                  vms, min_face_size, upload_url, identity_cache=None):
-    """Một frame: detect → track → identity → event → publish."""
+def recognize_people(frame, tracks, detections, extractor, verifier, min_face_size,
+                     identity_manager, identity_cache=None, now=None, force_ids=(), debug=False, alive_track_ids=None):
+    """Ghép mặt vào person track, nhận diện rồi giữ tên theo vòng đời track."""
+    now = time.monotonic() if now is None else now
+    face_tracks = associate_faces(detections, tracks)
+    valid_faces, face_identities = recognize_faces(
+        frame, face_tracks, extractor, verifier, min_face_size, debug=debug,
+        cache=identity_cache, now=now, force_ids=force_ids)
+    return valid_faces, identity_manager.update(tracks, face_identities, now, alive_track_ids)
+
+
+def process_frame(code, sample, tracker, face_detector, person_detector, extractor, verifier, processor,
+                  vms, min_face_size, upload_url, identity_manager, identity_cache=None):
+    """Một frame: person track + face ID → IN/OUT theo người → publish VMS."""
     frame = sample["frame"]
+    t0 = time.perf_counter()
 
-    # 1. Phát hiện mặt trên ảnh gốc.
-    detections = detector.predict([frame])[0]
-
-    # 2. Gán track_id. Mỗi camera có tracker riêng.
-    tracks = tracker.update(detections)
+    raw_detections = person_detector.detect(frame)
+    t1 = time.perf_counter()
+    tracks = tracker.update(raw_detections, frame)
+    alive_track_ids = None
+    if hasattr(tracker, "get_track_ids"):
+        alive_track_ids = tracker.get_track_ids()
+    t2 = time.perf_counter()
+    detections = face_detector.detect_many_faces(frame)
+    t3 = time.perf_counter()
     tracked_count = len(tracks)
 
-    # 3. Track mới nhận diện ngay; track cũ dùng cache đến kỳ làm mới.
-    tracks, identities = recognize_faces(frame, tracks, extractor, verifier, min_face_size,
-                                         cache=identity_cache, now=sample["captured_monotonic"])
-
-    # 4. Lấy vùng mới nhất từ VMS rồi xác định IN/OUT.
+    # 2. IN/OUT theo bbox người, kể cả khi không thấy mặt.
     zones = vms.get_zones(code)
     events = processor.process(code, tracks, frame.shape, zones,
                                now=sample["captured_monotonic"])
-    if identity_cache is not None and events:
-        event_ids = {event["track_id"] for event in events}
-        event_tracks = [track for track in tracks if track["track_id"] in event_ids]
-        _, fresh = recognize_faces(frame, event_tracks, extractor, verifier, min_face_size,
-                                    cache=identity_cache, now=sample["captured_monotonic"],
-                                    force_ids=event_ids)
-        identities.update(fresh)
-
-    # 5. Bbox gửi mỗi frame; snapshot chỉ upload khi có sự kiện.
-    vms.publish_bbox(code, tracks, frame.shape, identities=identities)
+    t4 = time.perf_counter()
+    # 3. Event có mặt thì xác minh lại ngay; không có mặt thì giữ tên trên person track.
+    valid_faces, identities = recognize_people(
+        frame, tracks, detections, extractor, verifier, min_face_size,
+        identity_manager=identity_manager, identity_cache=identity_cache,
+        now=sample["captured_monotonic"], force_ids={event["track_id"] for event in events}, alive_track_ids=alive_track_ids)
+    t5 = time.perf_counter()
+    # 4. Bbox người gửi mỗi frame; snapshot chỉ upload khi có sự kiện.
+    vms.publish_bbox(code, tracks, frame.shape, identities=identities, detection_class="person")
     snapshot_url = None
     if events and upload_url:
         import cv2
@@ -109,47 +130,62 @@ def process_frame(code, sample, tracker, detector, extractor, verifier, processo
                                    event_time=sample["captured_at"])
         logger.info("camera=%s track=%s direction=%s matched=%s published=%s",
                     code, event["track_id"], event["direction"], identity["matched"], success)
+    t6 = time.perf_counter()
+    timings_ms = {
+        "person": (t1 - t0) * 1000,
+        "tracking": (t2 - t1) * 1000,
+        "face_detect": (t3 - t2) * 1000,
+        "event": (t4 - t3) * 1000,
+        "recognition": (t5 - t4) * 1000,
+        "output": (t6 - t5) * 1000,
+        "total": (t6 - t0) * 1000,
+    }
     return {"detections": len(detections["bbox"]), "tracks": tracked_count,
-            "valid_faces": len(tracks), "matched": sum(bool(i["matched"]) for i in identities.values()),
+            "valid_faces": len(valid_faces), "matched": sum(bool(i["matched"]) for i in identities.values()),
             "zones": sum(z.get("is_active", True) and z.get("ai_modules", "FACE") == "FACE"
-                         for z in zones), "events": len(events)}
+                         for z in zones), "events": len(events),
+            "timing_ms": timings_ms}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Face recognition and IN/OUT events for VMS")
+    parser = argparse.ArgumentParser(description="Person tracking, face recognition and IN/OUT events for VMS")
     parser.add_argument("--config", type=Path, default=ROOT / "configs/config.yml")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--detector-model", help="InsightFace SCRFD model pack name (default: buffalo_s)")
     parser.add_argument("--debug", action="store_true", help="Log each bbox publish")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
-
-    # Import model tại đây để python main.py --help không cần nạp model/GPU.
-    from dotenv import load_dotenv
-    from src.core_ai.camera_reader import CameraReader
-    from src.core_ai.detector import InferenceWorker
-    from src.core_ai.extractor import Extractor
-    from src.core_ai.tracker import FaceTracker
-    from src.database.verifier import Verifier
-    from src.vms_service.vms_client import VMSClient
 
     load_dotenv(ROOT / ".env")
     config = load_config(args.config)
     runtime = config["runtime"]
     fps = float(runtime.get("processing_fps", 10))
     if fps <= 0:
-        raise ValueError("processing_fps phải > 0")
+        raise ValueError("processing_fps must > 0")
     min_face_size = int(runtime.get("min_face_size", 32))
     if min_face_size <= 0:
-        raise ValueError("min_face_size phải > 0")
+        raise ValueError("min_face_size must > 0")
     upload_url = os.getenv("VMS_STORAGE_UPLOAD_URL")
     if not upload_url:
-        logger.warning("Thiếu VMS_STORAGE_UPLOAD_URL: sự kiện sẽ không có snapshot")
+        logger.warning("lack VMS_STORAGE_UPLOAD_URL: event wont return snapshot")
 
-    detector_weights = model_path(os.getenv("FACE_DETECTOR_WEIGHTS") or config["model_detect"]["weight"])
-    extractor_weights = model_path(os.getenv("FACE_EXTRACTOR_WEIGHTS") or config["model_extract"]["weight"])
-    detector = InferenceWorker(wp=detector_weights, **config["inference"])
-    extractor = Extractor(extractor_weights)
+    inference = config.get("inference", {})
+    device = args.device
+    imgsz = inference.get("imgsz", 640)
+    det_size = (imgsz, imgsz) if isinstance(imgsz, int) else tuple(imgsz)
+    detector = SCRFDDetector(
+        model_name=args.detector_model or config.get("model_detect", {}).get("model_name", "buffalo_s"),
+        det_size=det_size, det_thresh=inference.get("conf", .5), device=device)
+    extractor_weights = model_path(config["model_extract"]["weight"])
+    extractor = InsightFaceExtractor(extractor_weights, device=device)
+    detector.warmup()
     extractor.warmup()
+    # YOLO dùng chung;
+    person_config = dict(config.get("person_tracking", {}))
+    person_detector = PersonDetector(model_path=model_path(person_config.get("weight", "yolo11n.pt")), conf=person_config.get("conf", 0.5),
+                                     imgsz=person_config.get("imgsz", 640), device=device)
+    person_detector.warmup()
     processor = EventProcessor(cooldown=runtime.get("event_cooldown", 1),
                                track_ttl=runtime.get("track_ttl", 2),
                                boundary_margin=runtime.get("boundary_margin", .003))
@@ -160,7 +196,7 @@ def main():
     try:
         verifier = Verifier(threshold=runtime["recognition_threshold"])
         vms.start()
-        logger.info("Pipeline đang chạy, chờ camera bật FACE từ VMS. Ctrl+C để dừng.")
+        logger.info("Pipeline running, wait for camera turn on FACE from VMS. Ctrl+C to stop.")
         while True:
             cycle_started = time.monotonic()
             cameras = {camera["code"]: camera for camera in vms.get_cameras()}
@@ -181,10 +217,12 @@ def main():
                 if code not in sessions:
                     reader = CameraReader(camera["id"], url)
                     sessions[code] = {"reader": reader, "url": url,
-                                      "tracker": FaceTracker(fps=fps), "generation": None,
+                                      "tracker": PersonTrackerDeepSort(),
+                                      "generation": None,
                                       "identity_cache": IdentityCache(
                                           interval=runtime.get("recognition_interval", .5),
                                           ttl=processor.track_ttl),
+                                      "identity_manager": IdentityManager(ttl=processor.track_ttl),
                                       "last_frame": None}
                     reader.start()
                     logger.info("Bắt đầu camera %s", code)
@@ -201,24 +239,54 @@ def main():
                 if (sample["generation"] != session["generation"]
                         or (session["last_frame"] is not None
                             and captured - session["last_frame"] > processor.track_ttl)):
-                    session["tracker"] = FaceTracker(fps=fps)
+                    session["tracker"].reset()
                     processor.reset(code)
                     session["identity_cache"].clear()
+                    session["identity_manager"].clear()
                 session["generation"] = sample["generation"]
                 session["last_frame"] = captured
-                status = process_frame(code, sample, session["tracker"], detector, extractor,
+                timing_state = session.setdefault("timing", {
+                    "started": time.monotonic(),
+                    "samples": [],
+                })
+                status = process_frame(code, sample, session["tracker"], detector, person_detector, extractor,
                                        verifier, processor, vms, min_face_size, upload_url,
-                                       identity_cache=session["identity_cache"])
+                                       identity_cache=session["identity_cache"],
+                                       identity_manager=session["identity_manager"])
+                timing_state["samples"].append(status["timings_ms"])
+
+                now = time.monotonic()
+                elapsed = now - timing_state["started"]
+
+                if elapsed >= 1.0:
+                    samples = timing_state["samples"]
+                    count = len(samples)
+                    averages = {
+                        key: sum(sample[key] for sample in samples) / count
+                        for key in samples[0]
+                    }
+                    worst_total = max(sample["total"] for sample in samples)
+                    details = " ".join(
+                        f"{key}={value:.1f}ms"
+                        for key, value in averages.items()
+                    )
+                    logger.info(
+                        "PERF camera=%s fps=%.1f %s max_total=%.1fms",
+                        code, count / elapsed, details, worst_total,
+                    )
+                    timing_state["samples"].clear()
+                    timing_state["started"] = now
+
                 if time.monotonic() >= session.get("next_status", 0):
                     logger.info("pipeline camera=%s %s", code, status)
                     if status["zones"] == 0:
-                        logger.warning("camera=%s: chưa có vùng/vạch FACE hoạt động; chưa thể sinh IN/OUT", code)
+                        logger.warning("camera=%s: have not line/polygon FACE; can't process IN/OUT", code)
                     session["next_status"] = time.monotonic()+2
 
             # Giới hạn FPS xử lý; model dùng chung và các camera xử lý lần lượt.
             time.sleep(max(0, 1/fps - (time.monotonic() - cycle_started)))
     except KeyboardInterrupt:
-        logger.info("Đang dừng pipeline...")
+        logger.info("STOPPING pipeline...")
     finally:
         for session in sessions.values():
             session["reader"].stop()

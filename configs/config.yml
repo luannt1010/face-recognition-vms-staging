@@ -1,10 +1,9 @@
 model_detect:
-  # Đường dẫn tương đối tính từ root project; ghi đè bằng FACE_DETECTOR_WEIGHTS.
-  weight: 'experiments/detector_tensorrt/outputs/img640/fp16/detector.engine'
+  model_name: 'buffalo_s'  # SCRFD cho main và run_demo.
+  weight: 'D:\\vms-combine-ai\\experiments\\detector_tensorrt\\outputs\\img640\\int8\\detector.engine'
 
 model_extract:
-  # Có thể ghi đè bằng FACE_EXTRACTOR_WEIGHTS.
-  weight: "D:/private/face-recognition-system/checkpoints/test_SGD/checkpoints/face_embedding_model.onnx"
+  weight: "D:\\vms-combine-ai\\models\\glintr100.onnx"
 
 inference:
   conf: 0.5
@@ -12,14 +11,22 @@ inference:
   classes: null
   device: 0
 
-# Phát IN/OUT khi tâm mặt đi vào/ra polygon hoặc cắt line của VMS.
+# Main và run_demo: YOLO COCO class 0 (person) + BoT-SORT, chưa dùng ReID.
+person_tracking:
+  weight: "D:\\vms-combine-ai\\yolo11n.engine"
+  conf: 0.4
+  imgsz: 640
+  enable_cmc: false  # Camera CCTV cố định; bật khi cần bù rung/chuyển động camera.
+  lost_track_buffer: 30  # Đơn vị frame ở 30 FPS, tracker tự scale theo processing_fps.
+
+# Phát IN/OUT khi tâm bbox người đi vào/ra polygon hoặc cắt line của VMS.
 runtime:
-  processing_fps: 10
+  processing_fps: 15
   recognition_threshold: 0.4
   # Theo từng camera + vùng + track. Chuyển hướng trong cooldown bị bỏ.
   event_cooldown: 1.0
   track_ttl: 2.0
   min_face_size: 32
   boundary_margin: 0.003
-  # Mỗi track nhận diện lại sau 0.5 giây; frame IN/OUT luôn dùng kết quả mới.
+  # Có mặt thì nhận diện lại sau 0.5 giây; frame IN/OUT có mặt sẽ xác minh ngay.
   recognition_interval: 0.5

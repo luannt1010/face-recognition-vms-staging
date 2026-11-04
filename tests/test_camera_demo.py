@@ -9,18 +9,26 @@ from unittest.mock import Mock, patch
 @unittest.skipUnless(importlib.util.find_spec('cv2') and importlib.util.find_spec('dotenv'),
                      'Demo requires OpenCV and python-dotenv')
 class DemoTests(unittest.TestCase):
-    def run_fake_demo(self, fail=False):
+    def run_fake_demo(self, fail=False, hide_face=False):
         import numpy as np
         from src.core_ai import camera_reader as demo
 
         detector, tracker, extractor, verifier, camera = [Mock() for _ in range(5)]
-        detector.predict.return_value = [{'bbox': [[30, 10, 70, 50]]}]
+        landmarks = np.array([[40, 20], [60, 20], [50, 30], [40, 40], [60, 40]], dtype=np.float32)
+        first_faces = {'bbox': np.array([[30, 10, 70, 50]]), 'det_score': np.array([.9]),
+                       'landmarks': landmarks[None]}
+        next_faces = {'bbox': np.array([[30, 50, 70, 90]]), 'det_score': np.array([.9]),
+                      'landmarks': (landmarks+40)[None]}
+        if hide_face:
+            next_faces = {'bbox': np.empty((0, 4)), 'det_score': np.empty(0),
+                          'landmarks': np.empty((0, 5, 2))}
+        detector.detect_many_faces.side_effect = [first_faces, next_faces, first_faces]
         if fail:
-            detector.predict.side_effect = RuntimeError('inference failed')
+            detector.detect_many_faces.side_effect = RuntimeError('inference failed')
         tracker.update.side_effect = [
-            [{'track_id': 1, 'bbox': [30, 10, 70, 50], 'is_detection': True}],
-            [{'track_id': 1, 'bbox': [30, 50, 70, 90], 'is_detection': True}],
-            [{'track_id': 1, 'bbox': [30, 10, 70, 50], 'is_detection': True}]]
+            [{'track_id': 1, 'bbox': [20, 0, 80, 80], 'is_detection': True}],
+            [{'track_id': 1, 'bbox': [20, 40, 80, 100], 'is_detection': True}],
+            [{'track_id': 1, 'bbox': [20, 0, 80, 80], 'is_detection': True}]]
         verifier.verify.side_effect = [{'matched': True, 'user_name': 'Test', 'score_match': .9},
                                       {'matched': True, 'user_name': 'Test', 'score_match': .9},
                                       {'matched': True, 'user_name': 'Test', 'score_match': .9}]
@@ -37,9 +45,9 @@ class DemoTests(unittest.TestCase):
                   'model_extract': {'weight': 'fake.onnx'}}
         modules = {}
         for name, class_name, obj in [
-            ('src.core_ai.detector', 'InferenceWorker', detector),
-            ('src.core_ai.tracker', 'FaceTracker', tracker),
-            ('src.core_ai.extractor', 'Extractor', extractor),
+            ('src.core_ai.detector', 'SCRFDDetector', detector),
+            ('src.core_ai.tracker', 'PersonTracker', tracker),
+            ('src.core_ai.extractor', 'InsightFaceExtractor', extractor),
             ('src.database.verifier', 'Verifier', verifier)]:
             module = ModuleType(name)
             setattr(module, class_name, Mock(return_value=obj))
@@ -58,14 +66,31 @@ class DemoTests(unittest.TestCase):
             stack.enter_context(patch.object(demo.cv2, 'waitKey', side_effect=[0, 0, 0, ord('q')]))
             if fail:
                 with self.assertRaisesRegex(RuntimeError, 'inference failed'):
-                    demo.run_demo(rtsp_url='fake')
+                    demo.run_demo(rtsp_url='fake', device='cpu')
             else:
-                demo.run_demo(rtsp_url='fake')
+                demo.run_demo(rtsp_url='fake', device='cpu')
                 self.assertEqual(printed.call_count, 2)
                 self.assertTrue(printed.call_args_list[0].args[0].startswith('[IN] track=1'))
                 self.assertTrue(printed.call_args_list[1].args[0].startswith('[OUT] track=1'))
                 self.assertIn('zone=demo-polygon', printed.call_args.args[0])
                 self.assertTrue(polygon_draw.call_args.args[2])  # closed polygon
+                self.assertIn('name=Test', printed.call_args_list[0].args[0])
+                self.assertEqual(extractor.extract.call_count, 2 if hide_face else 3)
+                for call in extractor.extract.call_args_list:
+                    self.assertEqual(call.args[0].shape, (100, 100, 3))  # full frame for alignment
+                    self.assertTrue(call.kwargs['align'])
+                if not hide_face:
+                    np.testing.assert_array_equal(extractor.extract.call_args_list[1].args[1], landmarks+40)
+            modules['src.core_ai.detector'].SCRFDDetector.assert_called_once_with(
+                model_name='buffalo_s', det_size=(640, 640), det_thresh=.5, device='cpu')
+            modules['src.core_ai.extractor'].InsightFaceExtractor.assert_called_once_with(
+                'fake.onnx', device='cpu')
+            detector.warmup.assert_called_once()
+            extractor.warmup.assert_called_once()
+            tracker.warmup.assert_called_once()
+            tracker.reset.assert_called_once()  # first stream generation
+            modules['src.core_ai.tracker'].PersonTracker.assert_called_once_with(
+                model_path='models/detector/yolo11n.pt', fps=1000, device='cpu')
         camera.stop.assert_called_once()
         verifier.close.assert_called_once()
 
@@ -74,3 +99,6 @@ class DemoTests(unittest.TestCase):
 
     def test_inference_error_still_closes_resources(self):
         self.run_fake_demo(fail=True)
+
+    def test_person_crossing_keeps_name_without_visible_face(self):
+        self.run_fake_demo(hide_face=True)

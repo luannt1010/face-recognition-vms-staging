@@ -19,7 +19,7 @@ def topic_code(code):
 
 
 class VMSClient:
-    def __init__(self, host, username, password, client_id=None, zone_id=51,
+    def __init__(self, host, username, password, client_id=None, zone_id=283,
                  organization_id=103, port=443):
         self.host, self.port = host, port
         self.zone_id, self.organization_id = zone_id, organization_id
@@ -48,7 +48,7 @@ class VMSClient:
         load_dotenv(Path(__file__).resolve().parents[2] / ".env")
         return cls(host=os.environ["MQTT_HOST"], username=os.environ["MQTT_USERNAME"],
                    password=os.environ["MQTT_PASSWORD"], client_id=os.getenv("MQTT_CLIENT_ID"),
-                   zone_id=int(os.getenv("VMS_ZONE_ID", "51")),
+                   zone_id=int(os.getenv("VMS_ZONE_ID", "283")),
                    organization_id=int(os.getenv("VMS_ORGANIZATION_ID", "103")),
                    port=int(os.getenv("MQTT_PORT", "443")))
 
@@ -73,6 +73,8 @@ class VMSClient:
         client.subscribe("smart_vms/cameras/+/ai_zones/FACE", qos=1)
         client.publish("smart_vms/cameras/getdevice", json.dumps({
             "zone_id": self.zone_id, "organization_id": self.organization_id}), qos=1)
+        logger.info("VMS camera scope: topic=%s zone_id=%s organization_id=%s",
+                    self.camera_topic, self.zone_id, self.organization_id)
         self.connected.set()
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties):
@@ -86,14 +88,26 @@ class VMSClient:
             data = json.loads(message.payload.decode("utf-8")) if message.payload else {}
             with self.lock:
                 if message.topic == self.camera_topic:
-                    self.cameras = {c["code"]: c for c in data.get("cameras", [])
+                    cameras = data.get("cameras", [])
+                    self.cameras = {c["code"]: c for c in cameras
                                     if "FACE" in c.get("ai_modules", [])}
-                    logger.info("VMS config: cameras_FACE=%s", list(self.cameras))
+                    logger.info("VMS config: topic=%s received=%s cameras_FACE=%s",
+                                message.topic, len(cameras), list(self.cameras))
+                    if not cameras:
+                        logger.warning("VMS trả 0 camera cho zone_id=%s; kiểm tra zone chứa camera "
+                                       "và organization_id=%s", self.zone_id, self.organization_id)
+                    elif not self.cameras:
+                        # Chỉ log mã camera/module, không log RTSP hoặc payload có mật khẩu.
+                        modules = [(c.get("code"), c.get("ai_modules", [])) for c in cameras[:10]]
+                        logger.warning("VMS trả %s camera nhưng không camera nào bật FACE; "
+                                       "camera_modules (tối đa 10)=%s", len(cameras), modules)
                 else:
                     # topic này chứa cả polygon và line crossing.
                     code = message.topic.split("/")[2]
                     self.zones[code] = data.get("ai_zones", [])
-                    logger.info("VMS config: camera=%s zones_FACE=%s", code, len(self.zones[code]))
+                    selected = any(topic_code(camera_code) == code for camera_code in self.cameras)
+                    logger.info("VMS config: camera=%s zones_FACE=%s camera_selected=%s",
+                                code, len(self.zones[code]), selected)
         except (ValueError, TypeError, KeyError, AttributeError):
             logger.warning("Bỏ payload cấu hình không hợp lệ từ %s", message.topic)
 
@@ -152,7 +166,7 @@ class VMSClient:
             data["snapshot_url"] = snapshot_url
         return self._publish("smart_vms/ai_events/FACE", data, qos=1)
 
-    def publish_bbox(self, camera_code, tracks, frame_shape, identities=None):
+    def publish_bbox(self, camera_code, tracks, frame_shape, identities=None, detection_class="face"):
         with self.lock:
             camera = deepcopy(self.cameras.get(camera_code))
         if camera is None:
@@ -169,7 +183,7 @@ class VMSClient:
                     for v, size in zip(track["bbox"], (width, height, width, height))]
             identity = identities.get(track["track_id"], {})
             detections.append({"id": str(track["track_id"]), "track_id": int(track["track_id"]),
-                               "class": "face", "confidence": float(track["score"]), "bbox": bbox,
+                               "class": detection_class, "confidence": float(track["score"]), "bbox": bbox,
                                "color": "#22c55e" if identity.get("matched") else "#ef4444"})
         return self._publish(f"smart_vms/ai/bbox/{topic_code(camera_code)}", {
             "ai_modules": "FACE", "camera_id": camera["id"], "camera_code": camera_code,

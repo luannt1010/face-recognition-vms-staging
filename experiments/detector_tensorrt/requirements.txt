@@ -1,0 +1,13 @@
+# Cài trong môi trường đã có PyTorch CUDA hoạt động.
+ultralytics>=8.3
+onnx
+onnxslim
+numpy
+opencv-python
+pandas
+matplotlib
+PyYAML
+jupyterlab
+ipykernel
+nbformat
+# TensorRT cài riêng theo hướng dẫn README, phù hợp CUDA/Python/GPU đích.

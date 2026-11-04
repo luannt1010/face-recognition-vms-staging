@@ -1,6 +1,7 @@
 import numpy as np
 import supervision as sv
-from trackers import ByteTrackTracker
+from src.utils import convert_yolo_2_ds
+from trackers import ByteTrackTracker, BoTSORTTracker
 
 
 class FaceTracker:
@@ -54,3 +55,70 @@ class FaceTracker:
                 "is_detection": True,
             })
         return results
+
+
+class PersonTrackerBoTSORT:
+    def __init__(self, fps=30, lost_track_buffer=30):
+        self.tracker = BoTSORTTracker(
+            frame_rate=fps,
+            track_activation_threshold=0.5,
+            high_conf_det_threshold=0.5,
+            lost_track_buffer=lost_track_buffer,
+            minimum_consecutive_frames=2
+        )
+
+    def update(self, detections, frame):
+        detections = sv.Detections(xyxy=detections["bbox"], confidence=detections["det_score"])
+        tracked = self.tracker.update(detections, frame=frame)
+        results = []
+        if tracked.tracker_id is None:
+            return results
+
+        for bbox, track_id, score in zip(tracked.xyxy, tracked.tracker_id, tracked.confidence):
+            if track_id is None or int(track_id) < 0:
+                continue
+
+            results.append({
+                "track_id": int(track_id),
+                "bbox": bbox.copy(),
+                "score": float(score),
+                "is_detection": True
+            })
+
+        return results
+
+    def reset(self):
+        self.tracker.reset()
+
+class PersonTrackerDeepSort:
+    def __init__(self, max_age=15, nn_budget=50, embedder="mobilenet"):
+        from deep_sort_realtime.deepsort_tracker import DeepSort
+        self.tracker = DeepSort(max_age=max_age,
+                                nn_budget=nn_budget,
+                                max_cosine_distance=0.4,
+                                embedder=embedder)
+
+    def update(self, detections, frame):
+        results = []
+        raw_detection = convert_yolo_2_ds(detections)
+        tracks = self.tracker.update_tracks(raw_detections=raw_detection, frame=frame)
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+            bbox = track.to_ltrb(orig=True, orig_strict=True)
+            score = track.get_det_conf()
+            if bbox is None:
+                continue
+            results.append({
+                "track_id": int(track.track_id),
+                "bbox": bbox,
+                "score": score,
+                "is_detection": True
+            })
+        return results
+
+    def get_track_ids(self):
+        return [int(track.track_id) for track in self.tracker.tracker.tracks if track.is_confirmed()]
+
+    def reset(self):
+        self.tracker.delete_all_tracks()

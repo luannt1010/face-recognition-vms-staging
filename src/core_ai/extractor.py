@@ -3,6 +3,27 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from src.utils import l2_normalize
+from insightface.model_zoo import get_model
+from insightface.utils import face_align
+
+class InsightFaceExtractor:
+    def __init__(self, model_path, device=0):
+        ctx_id = -1 if str(device).lower() == 'cpu' else int(device)
+        providers = ['CPUExecutionProvider'] if ctx_id < 0 else [
+            ('CUDAExecutionProvider', {'device_id': ctx_id}), 'CPUExecutionProvider']
+        self.model = get_model(model_path, providers=providers)
+        self.model.prepare(ctx_id=ctx_id)
+
+    def warmup(self):
+        self.extract(np.zeros((112, 112, 3), dtype=np.uint8))
+
+    def extract(self, frame, kps=None, align=False):
+        if align:
+            if kps is None:
+                raise ValueError("lack kps args")
+            frame = face_align.norm_crop(frame, landmark=kps, image_size=112)
+        embedding = self.model.get_feat(frame).flatten()
+        return l2_normalize(embedding)
 
 class Extractor:
     def __init__(self, wp):

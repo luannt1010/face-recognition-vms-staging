@@ -75,7 +75,7 @@ class ProcessorTests(unittest.TestCase):
 class ClientTests(unittest.TestCase):
     def setUp(self):
         with patch("src.vms_service.vms_client.mqtt.Client") as factory:
-            self.vms = VMSClient("example.invalid", "user", "password")
+            self.vms = VMSClient("example.invalid", "user", "password", zone_id=51)
         self.mqtt = factory.return_value
         self.message(self.vms.camera_topic, {"cameras": [
             {"id": "uuid", "code": "cổng/01", "ai_modules": ["FACE"]},
@@ -94,6 +94,29 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.vms.get_zones("cổng/01"), [])
         self.message(self.vms.camera_topic, {"cameras": []})
         self.assertFalse(self.vms.publish_face("cổng/01", {}, {}))
+
+    def test_empty_scope_and_disabled_modules_have_distinct_diagnostics(self):
+        with self.assertLogs('src.vms_service.vms_client', level='INFO') as logs:
+            self.message(self.vms.camera_topic, {'cameras': []})
+        self.assertIn('received=0', ' '.join(logs.output))
+        self.assertIn('zone_id=51', ' '.join(logs.output))
+        with self.assertLogs('src.vms_service.vms_client', level='INFO') as logs:
+            self.message(self.vms.camera_topic, {'cameras': [
+                {'code': 'OFF', 'ai_modules': ['ZONE'], 'rtsp_url': 'rtsp://hidden-secret'}]})
+        output = ' '.join(logs.output)
+        self.assertIn('received=1', output)
+        self.assertIn('OFF', output)
+        self.assertIn('ZONE', output)
+        self.assertNotIn('hidden-secret', output)
+        self.assertEqual(self.vms.get_cameras(), [])
+
+    def test_retained_zones_alone_do_not_enable_out_of_scope_camera(self):
+        self.message(self.vms.camera_topic, {'cameras': []})
+        with self.assertLogs('src.vms_service.vms_client', level='INFO') as logs:
+            self.message('smart_vms/cameras/outside/ai_zones/FACE', {'ai_zones': [POLYGON]})
+        self.assertIn('camera_selected=False', ' '.join(logs.output))
+        self.assertEqual(self.vms.get_cameras(), [])
+        self.assertEqual(self.vms.get_zones('outside'), [])
 
     def test_reconnect_subscribes_and_requests_again(self):
         for _ in range(2):
@@ -135,6 +158,11 @@ class ClientTests(unittest.TestCase):
                               identities={1: {"matched": True}})
         body = json.loads(self.mqtt.publish.call_args.args[1])
         self.assertEqual(body["detections"][0]["color"], "#22c55e")
+        self.assertEqual(body['detections'][0]['class'], 'face')
+        self.vms.publish_bbox('cổng/01', [track(.5, .5)], (100, 100), detection_class='person')
+        body = json.loads(self.mqtt.publish.call_args.args[1])
+        self.assertEqual(body['detections'][0]['class'], 'person')
+        self.assertEqual(body['ai_modules'], 'FACE')
 
     def test_publish_failure_and_snapshot_object_key(self):
         self.assertFalse(self.vms._publish("topic", {}, 1))

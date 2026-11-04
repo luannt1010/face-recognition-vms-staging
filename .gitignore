@@ -112,11 +112,3 @@ temp/
 .DS_Store
 Thumbs.db
 desktop.ini
-
-/bao_cao_face
-
-/docker
-
-/experiments
-/models
-/VMS_INTEGRATION.md
